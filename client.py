@@ -5,40 +5,120 @@ import math # Corrected import
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from inverted_pendulum import InvertedPendulum
+import select
+import time
 
 # --- Configuration ---
 HOST = '127.0.0.1'
 PORT = 65432
-DT = 0.05  # 10 ms periodicity
+DT = 0.01  # 10 ms periodicity
 
 # --- Global objects ---
 # Start the pendulum slightly off-center to see the controller work
 pendulum = InvertedPendulum(initial_state=[0.0, 0.0, 0.05, 0.0])  # Smaller initial angle
 sock = None
 
+# --- Stability Metrics Tracking ---
+metrics = {
+    'angles': [],
+    'positions': [],
+    'times': [],
+    'forces': [],
+    'fall_time': None,
+    'settled': False,
+    'settling_time': None,
+    'peak_overshoot': 0.0,
+    'steady_state_error': None,
+    'max_angle': 0.0,
+    'ISE': 0.0,
+    'ITAE': 0.0,
+    'control_effort': 0.0
+}
+
+SETTLING_BAND = math.radians(2)  # ±2% band in radians (approx 2 deg)
+SETTLING_TIME_WINDOW = 1.0  # seconds to consider as 'settled'
+
+
+def update_metrics(state, t):
+    x, x_dot, theta, theta_dot = state
+    metrics['angles'].append(theta)
+    metrics['positions'].append(x)
+    metrics['times'].append(t)
+    force = network_control_step.last_action if hasattr(network_control_step, 'last_action') else 0.0
+    metrics['forces'].append(force)
+    abs_theta = abs(theta)
+    if abs_theta > metrics['max_angle']:
+        metrics['max_angle'] = abs_theta
+    if abs_theta > metrics['peak_overshoot']:
+        metrics['peak_overshoot'] = abs_theta
+    # Update ISE, ITAE, and control effort (using rectangle rule)
+    if len(metrics['angles']) > 1:
+        dt = metrics['times'][-1] - metrics['times'][-2]
+        metrics['ISE'] += theta**2 * dt
+        metrics['ITAE'] += t * abs(theta) * dt
+        metrics['control_effort'] += force**2 * dt
+
+
+def compute_settling_time():
+    """Compute settling time: time after which angle stays within SETTLING_BAND for SETTLING_TIME_WINDOW."""
+    angles = metrics['angles']
+    times = metrics['times']
+    for i in range(len(angles)):
+        if all(abs(a) < SETTLING_BAND for a in angles[i:i+int(SETTLING_TIME_WINDOW/DT)]):
+            return times[i]
+    return None
+
+
+def compute_steady_state_error():
+    """Compute steady-state error as mean of last 1 second of angles."""
+    N = int(1.0 / DT)
+    if len(metrics['angles']) < N:
+        return None
+    return sum(metrics['angles'][-N:]) / N
+
+
+def print_metrics():
+    print("\n--- Stability Metrics ---")
+    print(f"Settling Time: {metrics['settling_time'] if metrics['settling_time'] is not None else 'Not settled'} s")
+    print(f"Peak Overshoot: {math.degrees(metrics['peak_overshoot']):.2f} deg")
+    print(f"Steady-State Error: {math.degrees(metrics['steady_state_error']) if metrics['steady_state_error'] is not None else 'N/A'} deg")
+    print(f"Max Angle from Vertical: {math.degrees(metrics['max_angle']):.2f} deg")
+    print(f"Fall Time: {metrics['fall_time'] if metrics['fall_time'] is not None else 'Did not fall'} s")
+    print(f"ISE (Integral of Squared Error): {metrics['ISE']:.4f}")
+    print(f"ITAE (Integral of Time-weighted Abs Error): {metrics['ITAE']:.4f}")
+    print(f"Control Effort (∫u²dt): {metrics['control_effort']:.4f}")
+
+
 def network_control_step():
-    """Performs one step of the networked control loop."""
+    """Performs one step of the networked control loop without artificial delay."""
     global sock, pendulum
-    
+    if not hasattr(network_control_step, 'last_action'):
+        network_control_step.last_action = 0.0
+
     # 1. Get current state from the simulation
     current_state = pendulum.get_state()
-    
-    # 2. Send state to the server
-    state_data = json.dumps(current_state).encode('utf-8')
+
+    # 2. Send state to the server, with newline delimiter
+    state_data = (json.dumps(current_state) + '\n').encode('utf-8')
     sock.sendall(state_data)
-    
-    # 3. Receive actuation from the server
-    actuation_data = sock.recv(1024)
-    if not actuation_data:
-        print("Server disconnected.")
-        return False, None
-        
-    actuation = json.loads(actuation_data.decode('utf-8'))
-    force = actuation['force']
-    
-    # 4. Apply actuation to the simulation
-    pendulum.step(force, DT)
-    
+
+    # 3. Non-blocking receive for actuation from the server
+    ready = select.select([sock], [], [], 0)
+    if ready[0]:
+        actuation_data = sock.recv(1024)
+        if actuation_data:
+            # Split by newline and parse the first complete message
+            messages = actuation_data.decode('utf-8').split('\n')
+            for msg in messages:
+                if msg.strip():
+                    actuation = json.loads(msg)
+                    network_control_step.last_action = actuation['force']
+                    break
+    # If not ready, use last_action
+
+    # 4. Apply the last received force to the simulation
+    pendulum.step(network_control_step.last_action, DT)
+
     return True, pendulum.get_state()
 
 # --- Visualization Setup ---
@@ -62,7 +142,9 @@ def init_animation():
 
 def update_animation(frame):
     """This function is called by FuncAnimation to update the plot."""
+    t = frame * DT
     success, state = network_control_step()
+    update_metrics(state, t)
     
     if not success:
         ani.event_source.stop()
@@ -86,8 +168,20 @@ def update_animation(frame):
     # Failure condition (pole falls too far)
     if abs(theta) > math.radians(45):
         print("Pendulum has fallen!")
+        metrics['fall_time'] = t
         ani.event_source.stop()
-
+        metrics['settling_time'] = compute_settling_time()
+        metrics['steady_state_error'] = compute_steady_state_error()
+        print_metrics()
+    # Check for settling (if not already settled and not fallen)
+    if not metrics['settled'] and metrics['fall_time'] is None:
+        settling_time = compute_settling_time()
+        if settling_time is not None:
+            metrics['settled'] = True
+            metrics['settling_time'] = settling_time
+            metrics['steady_state_error'] = compute_steady_state_error()
+            print("System settled at t = {:.2f} s".format(settling_time))
+            print_metrics()
     return cart, pole, state_text
 
 # --- Main Execution ---

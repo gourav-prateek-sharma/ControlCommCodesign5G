@@ -13,10 +13,10 @@ class InvertedPendulum:
     def __init__(self, initial_state=[0.0, 0.0, 0.05, 0.0]):
         # Physical constants
         self.gravity = 9.8
-        self.mass_cart = 0.5
-        self.mass_pole = 0.2
+        self.mass_cart = 1.0
+        self.mass_pole = 0.5
         self.total_mass = self.mass_cart + self.mass_pole
-        self.length = 0.3  # actually half the pole's length
+        self.length = 0.5  # actually half the pole's length
         self.pole_mass_length = self.mass_pole * self.length
         
         # State vector

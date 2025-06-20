@@ -5,11 +5,14 @@ from pid_controller import PID
 from inverted_pendulum import InvertedPendulum  # Assuming this is the correct import for your InvertedPendulum class
 import numpy as np
 from control import lqr
+import time
 
 # --- Configuration ---
 HOST = '127.0.0.1'  # Standard loopback interface address (localhost)
 PORT = 65432        # Port to listen on (non-privileged ports are > 1023)
-DT = 0.1          # Simulation time step, must match client
+DT = 0.01          # Simulation time step, must match client
+control_delay = 0.1  # Control delay in simulation steps (10x DT)
+max_perturbation = 0.1  # Range for perturbation noise
 
 def run_server():
     # --- Controller Setup (Gains from your reference) ---
@@ -67,56 +70,64 @@ def run_server():
         conn, addr = s.accept()
         with conn:
             print(f"Connected by {addr}")
+            buffer = ''
             while True:
-                # 1. Receive state from client
+                # 1. Receive state from client (handle newline-delimited JSON)
                 data = conn.recv(1024)
                 if not data:
                     print("Client disconnected.")
                     break
-                
-                # Decode the state from JSON
-                state = json.loads(data.decode('utf-8'))
-                x, x_dot, theta, theta_dot = state
-                
-                # --- 2. Compute Actuation (Force) ---
-                
-                # Position controller output (PD)
-                # Force proportional to position error and velocity
-                force_x = kp_x * (x_sp - x) + kd_x * x_dot + x_bias
-                
-                # Angle controller output (PID)
-                # We use the PID class to compute the force needed to correct the angle.
-                # The input to the controller is the current angle 'theta'.
-                force_theta = angle_pid.compute(theta)
+                buffer += data.decode('utf-8')
+                while '\n' in buffer:
+                    msg, buffer = buffer.split('\n', 1)
+                    if not msg.strip():
+                        continue
+                    # Decode the state from JSON
+                    state = json.loads(msg)
+                    x, x_dot, theta, theta_dot = state
+                    
+                    # --- 2. Compute Actuation (Force) ---
+                    
+                    # Position controller output (PD)
+                    # Force proportional to position error and velocity
+                    force_x = kp_x * (x_sp - x) + kd_x * x_dot + x_bias
+                    
+                    # Angle controller output (PID)
+                    # We use the PID class to compute the force needed to correct the angle.
+                    # The input to the controller is the current angle 'theta'.
+                    force_theta = angle_pid.compute(theta)
 
-                # Total Force Calculation
-                # The final force is the sum of the two controller outputs.
-                # The negative sign is crucial and standard in this control formulation.
-                total_force = -(force_x + force_theta)
+                    # Total Force Calculation
+                    # The final force is the sum of the two controller outputs.
+                    # The negative sign is crucial and standard in this control formulation.
+                    total_force = -(force_x + force_theta)
 
-                # Clamp the total force to the maximum allowed value
-                if abs(total_force) > F_max:
-                    total_force = F_max if total_force > 0 else -F_max
+                    # Clamp the total force to the maximum allowed value
+                    if abs(total_force) > F_max:
+                        total_force = F_max if total_force > 0 else -F_max
 
-                print(f"State[x={x:.2f}, θ={theta:.3f}] -> Force[pos={-force_x:.2f}, ang={-force_theta:.2f}] -> Total={total_force:.2f}")
+                    print(f"State[x={x:.2f}, θ={theta:.3f}] -> Force[pos={-force_x:.2f}, ang={-force_theta:.2f}] -> Total={total_force:.2f}")
 
-                # LQR control logic
-                state_vector = np.array([x, x_dot, theta, theta_dot])
-                lqr_force = -np.dot(K, state_vector)
+                    # LQR control logic
+                    state_vector = np.array([x, x_dot, theta, theta_dot])
+                    lqr_force = -np.dot(K, state_vector)
 
-                # Introduce a small perturbation to the LQR force
-                perturbation = np.random.uniform(-0.5, 0.5)  # Random noise in range [-0.5, 0.5]
-                lqr_force += perturbation
+                    # Introduce a small perturbation to the LQR force
+                    perturbation = np.random.uniform(-max_perturbation, max_perturbation)  # Random noise in range [-0.5, 0.5]
+                    lqr_force += perturbation
 
-                # Clamp the perturbed LQR force to the maximum allowed value
-                if abs(lqr_force) > F_max:
-                    lqr_force = F_max if lqr_force > 0 else -F_max
+                    # Clamp the perturbed LQR force to the maximum allowed value
+                    if abs(lqr_force) > F_max:
+                        lqr_force = F_max if lqr_force > 0 else -F_max
 
-                print(f"State[x={x:.2f}, θ={theta:.3f}] -> Perturbed LQR Force={lqr_force:.2f}")
+                    print(f"State[x={x:.2f}, θ={theta:.3f}] -> Perturbed LQR Force={lqr_force:.2f}")
 
-                # 3. Send actuation back to client
-                actuation_data = {'force': lqr_force}
-                conn.sendall(json.dumps(actuation_data).encode('utf-8'))
+                    # 3. Send actuation back to client
+                    actuation_data = {'force': lqr_force}
+                    conn.sendall(json.dumps(actuation_data).encode('utf-8'))
+
+                    # Sleep for control delay (simulate actuation delay)
+                    time.sleep(DT * control_delay)
 
 def lqr_control(A, B, Q, R):
     """Compute the LQR gain matrix."""
