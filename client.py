@@ -7,6 +7,8 @@ import matplotlib.animation as animation
 from inverted_pendulum import InvertedPendulum
 import select
 import time
+import argparse
+import csv
 
 # --- Configuration ---
 HOST = '127.0.0.1'
@@ -107,13 +109,18 @@ def network_control_step():
     if ready[0]:
         actuation_data = sock.recv(1024)
         if actuation_data:
-            # Split by newline and parse the first complete message
+            # Split by newline and parse the first valid JSON message
             messages = actuation_data.decode('utf-8').split('\n')
             for msg in messages:
-                if msg.strip():
+                msg = msg.strip()
+                if not msg:
+                    continue
+                try:
                     actuation = json.loads(msg)
                     network_control_step.last_action = actuation['force']
                     break
+                except json.JSONDecodeError:
+                    continue  # Skip lines that can't be parsed
     # If not ready, use last_action
 
     # 4. Apply the last received force to the simulation
@@ -145,26 +152,22 @@ def update_animation(frame):
     t = frame * DT
     success, state = network_control_step()
     update_metrics(state, t)
-    
-    if not success:
-        ani.event_source.stop()
-        return cart, pole, state_text
-
     x, x_dot, theta, theta_dot = state
-    
     # Drawing logic
-    # The pendulum model uses 'length' as half the pole length
     pole_length = pendulum.length * 2
     pole_x = [x, x + pole_length * math.sin(theta)]
     pole_y = [0, pole_length * math.cos(theta)]
-    
     cart.set_data([x], [0])
     pole.set_data(pole_x, pole_y)
-    
-    # Update state text
-    state_str = f'x = {x:.2f} m\nθ = {math.degrees(theta):.2f}°'
+    # Update state text with dynamic metrics
+    state_str = (
+        f'x = {x:.2f} m\n'
+        f'θ = {math.degrees(theta):.2f}°\n'
+        f'ISE: {metrics["ISE"]:.4f}\n'
+        f'ITAE: {metrics["ITAE"]:.4f}\n'
+        f'Control Effort: {metrics["control_effort"]:.4f}'
+    )
     state_text.set_text(state_str)
-
     # Failure condition (pole falls too far)
     if abs(theta) > math.radians(45):
         print("Pendulum has fallen!")
@@ -184,23 +187,60 @@ def update_animation(frame):
             print_metrics()
     return cart, pole, state_text
 
+def run_headless(sim_time=10.0, metrics_file='metrics_log.csv'):
+    """Run the simulation without GUI and log metrics to a CSV file."""
+    t = 0.0
+    frame = 0
+    with open(metrics_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['time', 'theta', 'ISE', 'ITAE', 'control_effort'])
+        while t < sim_time:
+            success, state = network_control_step()
+            update_metrics(state, t)
+            theta = state[2]
+            writer.writerow([
+                t,
+                theta,
+                metrics['ISE'],
+                metrics['ITAE'],
+                metrics['control_effort']
+            ])
+            if abs(theta) > math.radians(45):
+                print(f"Pendulum has fallen at t={t:.2f}s!")
+                metrics['fall_time'] = t
+                break
+            t += DT
+            frame += 1
+            time.sleep(DT)  # Real-time pacing for headless mode
+    metrics['settling_time'] = compute_settling_time()
+    metrics['steady_state_error'] = compute_steady_state_error()
+    print_metrics()
+    print(f"Metrics logged to {metrics_file}")
+
 # --- Main Execution ---
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--no-gui', action='store_true', help='Run without GUI and log metrics to file')
+    parser.add_argument('--sim-time', type=float, default=10.0, help='Simulation time for headless mode (seconds)')
+    parser.add_argument('--metrics-file', type=str, default='metrics_log.csv', help='CSV file to log metrics')
+    args = parser.parse_args()
+
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         print(f"Connecting to server at {HOST}:{PORT}...")
         sock.connect((HOST, PORT))
         print("Connection successful!")
-        
-        ani = animation.FuncAnimation(fig, update_animation,
-                                      frames=None,
-                                      init_func=init_animation,
-                                      blit=True,
-                                      interval=DT * 1000,
-                                      repeat=False)
-        plt.legend()
-        plt.show()
-
+        if args.no_gui:
+            run_headless(sim_time=args.sim_time, metrics_file=args.metrics_file)
+        else:
+            ani = animation.FuncAnimation(fig, update_animation,
+                                          frames=None,
+                                          init_func=init_animation,
+                                          blit=True,
+                                          interval=DT * 1000,
+                                          repeat=False)
+            plt.legend()
+            plt.show()
     except ConnectionRefusedError:
         print("\n[ERROR] Connection refused. Is the server script running in another terminal?")
     except Exception as e:
